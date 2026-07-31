@@ -211,6 +211,12 @@ class AlertOverlay:
         self.border_id = self.canvas.create_rectangle(6, 6, sw - 6, sh - 6, outline="#b02020", width=6)
 
         cx, cy = sw // 2, sh // 2
+
+        self.face_cy = cy - 220
+        self.angry_face_items = self._build_face(cx, self.face_cy, 55, "angry")
+        self.happy_face_items = self._build_face(cx, self.face_cy, 55, "happy")
+        self.canvas.itemconfigure("happy_face", state="hidden")
+
         self.title_id = self.canvas.create_text(
             cx, cy - 120, text="PERIMETER BREACH", fill="#ff4040", font=("Consolas", 54, "bold")
         )
@@ -234,6 +240,64 @@ class AlertOverlay:
 
         self.win.withdraw()
 
+    def _build_face(self, cx, cy, r, expression):
+        """Draws a simple vector face (no image assets needed) tagged by
+        expression so the two states can be shown/hidden as a group."""
+        tag = f"{expression}_face"
+        items = []
+
+        face_color = "#ff4040" if expression == "angry" else "#4fd67a"
+        feature_color = "#2a0808" if expression == "angry" else "#0a2e1a"
+
+        items.append(self.canvas.create_oval(
+            cx - r, cy - r, cx + r, cy + r, fill=face_color, outline="", tags=(tag,)
+        ))
+
+        eye_r = r * 0.11
+        eye_dx = r * 0.38
+        eye_dy = r * 0.12
+
+        if expression == "angry":
+            # Slanted eyebrows angled inward/down - the classic "angry" cue
+            brow_len = r * 0.42
+            items.append(self.canvas.create_line(
+                cx - eye_dx - brow_len * 0.6, cy - eye_dy - r * 0.55,
+                cx - eye_dx + brow_len * 0.4, cy - eye_dy - r * 0.15,
+                fill=feature_color, width=max(3, int(r * 0.09)), capstyle="round", tags=(tag,)
+            ))
+            items.append(self.canvas.create_line(
+                cx + eye_dx + brow_len * 0.6, cy - eye_dy - r * 0.55,
+                cx + eye_dx - brow_len * 0.4, cy - eye_dy - r * 0.15,
+                fill=feature_color, width=max(3, int(r * 0.09)), capstyle="round", tags=(tag,)
+            ))
+
+        # Eyes (same for both - shape reads via brows/mouth, not eye size)
+        items.append(self.canvas.create_oval(
+            cx - eye_dx - eye_r, cy - eye_dy - eye_r, cx - eye_dx + eye_r, cy - eye_dy + eye_r,
+            fill=feature_color, outline="", tags=(tag,)
+        ))
+        items.append(self.canvas.create_oval(
+            cx + eye_dx - eye_r, cy - eye_dy - eye_r, cx + eye_dx + eye_r, cy - eye_dy + eye_r,
+            fill=feature_color, outline="", tags=(tag,)
+        ))
+
+        # Mouth: bottom arc (U-shape) = smile, top arc (∩-shape) = frown
+        mouth_r = r * 0.5
+        mouth_cy = cy + r * 0.28
+        mouth_w = max(3, int(r * 0.1))
+        if expression == "angry":
+            items.append(self.canvas.create_arc(
+                cx - mouth_r, mouth_cy - mouth_r * 0.6, cx + mouth_r, mouth_cy + mouth_r * 0.6,
+                start=20, extent=140, style="arc", outline=feature_color, width=mouth_w, tags=(tag,)
+            ))
+        else:
+            items.append(self.canvas.create_arc(
+                cx - mouth_r, mouth_cy - mouth_r * 0.6, cx + mouth_r, mouth_cy + mouth_r * 0.6,
+                start=200, extent=140, style="arc", outline=feature_color, width=mouth_w, tags=(tag,)
+            ))
+
+        return items
+
     def _set_alpha(self, alpha):
         try:
             self.win.attributes("-alpha", alpha)
@@ -253,6 +317,8 @@ class AlertOverlay:
         self.canvas.itemconfig(self.escalation_id, text="")
         self.canvas.itemconfig(self.sub_id, text=self.BREACH_MSG)
         self.canvas.itemconfig(self.bar_fill, fill="#ff5050")
+        self.canvas.itemconfigure("angry_face", state="normal")
+        self.canvas.itemconfigure("happy_face", state="hidden")
         bg_coords = self.canvas.coords(self.bar_bg)
         self.canvas.coords(self.bar_fill, self._bar_x0, bg_coords[1], self._bar_x0, bg_coords[3])
 
@@ -291,9 +357,13 @@ class AlertOverlay:
         if phase == "retreating":
             self.canvas.itemconfig(self.sub_id, text=self.RETREAT_MSG)
             self.canvas.itemconfig(self.bar_fill, fill="#4fd67a")
+            self.canvas.itemconfigure("angry_face", state="hidden")
+            self.canvas.itemconfigure("happy_face", state="normal")
         else:
             self.canvas.itemconfig(self.sub_id, text=self.BREACH_MSG)
             self.canvas.itemconfig(self.bar_fill, fill="#ff5050")
+            self.canvas.itemconfigure("angry_face", state="normal")
+            self.canvas.itemconfigure("happy_face", state="hidden")
 
     def _pulse(self):
         if not self.visible:
@@ -378,6 +448,8 @@ class SecurityMonitor:
         self._lockdown_wall_start = None
         self.last_packet_time = time.time()
         self._last_attended_notice = 0.0
+        self._last_sent_attended = None
+        self._last_attended_check = 0.0
 
         atexit.register(self.cleanup)
         self._setup_hotkey()
@@ -402,11 +474,31 @@ class SecurityMonitor:
             try:
                 self.serial_conn = serial.Serial(self.cfg["serial_port"], self.cfg["baud_rate"], timeout=1)
                 print(f"[+] Interface bound securely to {self.cfg['serial_port']}")
+                self._last_sent_attended = None  # force a fresh sync - the board resets on connect
                 return
             except serial.SerialException as e:
                 print(f"[-] Connection failed ({e}); retrying in {delay}s...")
                 time.sleep(delay)
                 delay = min(delay * 2, self.cfg["reconnect_max_delay_seconds"])
+
+    def sync_attended_state(self):
+        """Push whether the machine looks actively-used to the Arduino, so the
+        physical buzzer/LED mute themselves too (not just the software lockdown).
+        Throttled - idle time doesn't need millisecond precision."""
+        if not self.cfg["require_idle_for_lockdown"]:
+            return
+        now = time.time()
+        if now - self._last_attended_check < 0.3:
+            return
+        self._last_attended_check = now
+
+        attended = get_idle_seconds() < self.cfg["idle_threshold_seconds"]
+        if attended != self._last_sent_attended:
+            self._last_sent_attended = attended
+            try:
+                self.serial_conn.write(f"SET_ATTENDED:{1 if attended else 0}\n".encode("ascii"))
+            except (serial.SerialException, AttributeError, OSError):
+                pass
 
     # -- alerting / lockdown ---------------------------------------------------
 
@@ -560,6 +652,7 @@ class SecurityMonitor:
         try:
             while self.running:
                 try:
+                    self.sync_attended_state()
                     if self.serial_conn.in_waiting > 0:
                         raw_line = self.serial_conn.readline().decode("utf-8", errors="ignore").strip()
                         self.handle_packet(raw_line)
