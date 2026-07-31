@@ -75,7 +75,3 @@ If a CRITICAL/OVERRIDE state persists while the machine is idle, a fullscreen wa
 - Windows-only (relies on Win32 APIs for window control and workstation locking).
 - The ultrasonic sensor has a narrow (~15°) beam — it only covers what's directly in front of it, not the whole room.
 - Idle-time correlation isn't perfect: quiet reading with no keyboard/mouse input can eventually register as "away."
-
-## License
-
-MIT — see `LICENSE`.
